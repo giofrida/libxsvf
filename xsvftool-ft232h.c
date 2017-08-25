@@ -35,6 +35,7 @@
  */
 
 #include "libxsvf.h"
+#include "ftdi_i.h"
 
 #define BUFFER_SIZE (1024*16)
 
@@ -84,6 +85,7 @@ struct udata_s {
 	struct ftdi_context ftdic;
 	uint16_t device_vendor;
 	uint16_t device_product;
+	const char *device_string;
 	int device_channel;
 	int eeprom_size;
 	int buffer_size;
@@ -245,7 +247,7 @@ static void transfer_tms_job_handler(struct udata_s *u, struct read_job_s *job, 
 		// seams like output is align to the MSB in the byte and is LSB first
 		int bitpos = i + (8 - job->bits_len);
 		int line_tdo = (*data & (1 << bitpos)) != 0 ? 1 : 0;
-		if (job->buffer[i].tdo_enable && job->buffer[i].tdo != line_tdo)
+		if (job->buffer[i].tdo_enable && job->buffer[i].tdo != line_tdo && !u->forcemode)
 			u->error_rc = -1;
 		if (job->buffer[i].rmask && u->retval_i < 256)
 			u->retval[u->retval_i++] = line_tdo;
@@ -529,8 +531,8 @@ static int h_setup(struct libxsvf_host *h)
 	if (ftdi_init(&u->ftdic) < 0)
 		return -1;
 	
-	if (u->eeprom_size > 0)
-		u->ftdic.eeprom_size = u->eeprom_size;
+	//if (u->eeprom_size > 0)
+	//	u->ftdic.eeprom->size = u->eeprom_size;
 
 	if (u->device_channel > 0) {
 		enum ftdi_interface interface =
@@ -547,6 +549,12 @@ static int h_setup(struct libxsvf_host *h)
 
 	if (u->device_vendor > 0 || u->device_product > 0) {
 		if (ftdi_usb_open(&u->ftdic, u->device_vendor, u->device_product) == 0)
+			goto found_device;
+		goto failed_device;
+	}
+
+	if (u->device_string != NULL) {
+		if (ftdi_usb_open_string(&u->ftdic, u->device_string) == 0)
 			goto found_device;
 		goto failed_device;
 	}
@@ -845,7 +853,7 @@ static void help()
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Usage: %s [ -v[v..] ] [ -d dumpfile ] [ -L | -B ] [ -S ] [ -F ] \\\n", progname);
 	fprintf(stderr, "      %*s [ -D vendor:product ] [ -C channel ] [ -f freq[k|M] ] \\\n", (int)(strlen(progname)+1), "");
-	fprintf(stderr, "      %*s [ -Z eeprom-size] [ [-G] -W eeprom-filename ] [ -R eeprom-filename ] \\\n", (int)(strlen(progname)+1), "");
+	fprintf(stderr, "      %*s [ -Z eeprom-size] [ [-G|-I] -W eeprom-filename ] [ -R eeprom-filename ] \\\n", (int)(strlen(progname)+1), "");
 	fprintf(stderr, "      %*s { -s svf-file | -x xsvf-file | -c } ...\n", (int)(strlen(progname)+1), "");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "   -v\n");
@@ -869,6 +877,14 @@ static void help()
 	fprintf(stderr, "   -D vendor:product\n");
 	fprintf(stderr, "          Select device using USB vendor and product id\n");
 	fprintf(stderr, "\n");
+	fprintf(stderr, "   -D device-string\n");
+	fprintf(stderr, "          use the specified USB device:\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "            d:<devicenode>                (e.g. d:002/005)\n");
+	fprintf(stderr, "            i:<vendor>:<product>          (e.g. i:0x0403:0x6010)\n");
+	fprintf(stderr, "            i:<vendor>:<product>:<index>  (e.g. i:0x0403:0x6010:0)\n");
+	fprintf(stderr, "            s:<vendor>:<product>:<serial-string>\n");
+	fprintf(stderr, "\n");
 	fprintf(stderr, "   -C channel\n");
 	fprintf(stderr, "          Select channel on target device (A, B, C or D)\n");
 	fprintf(stderr, "\n");
@@ -877,6 +893,9 @@ static void help()
 	fprintf(stderr, "\n");
 	fprintf(stderr, "   -G\n");
 	fprintf(stderr, "          Generate checksum before writing EEPROM data\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "   -I\n");
+	fprintf(stderr, "          Ignore (do not check) checksum before writing EEPROM data\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "   -W eeprom-filename\n");
 	fprintf(stderr, "          Write content of the given file to the FTDI EEPROM\n");
@@ -901,11 +920,12 @@ int main(int argc, char **argv)
 	int rc = 0;
 	int gotaction = 0;
 	int genchecksum = 0;
+	int ignchecksum = 0;
 	int hex_mode = 0;
 	int opt, i, j;
 
 	progname = argc >= 1 ? argv[0] : "xsvftool-ft232h";
-	while ((opt = getopt(argc, argv, "vd:LBSFD:C:Z:GW:R:f:x:s:c")) != -1)
+	while ((opt = getopt(argc, argv, "vd:LBSFD:C:Z:GIW:R:f:x:s:c")) != -1)
 	{
 		switch (opt)
 		{
@@ -943,7 +963,9 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'D':
-			{
+			if (optarg[0] && optarg[1] == ':') {
+				u.device_string = optarg;
+			} else {
 				char *endptr = NULL;
 				u.device_vendor = strtol(optarg, &endptr, 16);
 				if (!endptr || *endptr != ':')
@@ -979,45 +1001,61 @@ int main(int argc, char **argv)
 		case 'G':
 			genchecksum = 1;
 			break;
+		case 'I':
+			ignchecksum = 1;
+			break;
 		case 'W':
 			{
 				gotaction = 1;
 				if (h_setup(&h) < 0)
 					return 1;
-				unsigned char eeprom_data[u.ftdic.eeprom_size];
-
+            int eeprom_size;    
+				unsigned char *eeprom_data;
+            
+            eeprom_data = malloc(256);    // maximum size for eeproms
 				FILE *f = fopen(optarg, "r");
 				if (f == NULL) {
 					fprintf(stderr, "Can't open EEPROM file `%s' for reading: %s\n", optarg, strerror(errno));
 					h_shutdown(&h);
 					return 1;
 				}
-				if (fread(eeprom_data, u.ftdic.eeprom_size, 1, f) != 1) {
+				if ((eeprom_size = fread(eeprom_data, 1, 256, f)) < 128) {        // eeprom size must be 128 minimum
 					fprintf(stderr, "Can't read EEPROM file `%s': %s\n", optarg, strerror(errno));
 					h_shutdown(&h);
 					return 1;
 				}
 				fclose(f);
 
-				uint16_t checksum = eeprom_checksum(eeprom_data, u.ftdic.eeprom_size-2);
+				uint16_t checksum = eeprom_checksum(eeprom_data, eeprom_size-2);
 				if (genchecksum) {
-					eeprom_data[u.ftdic.eeprom_size-1] = checksum >> 8;
-					eeprom_data[u.ftdic.eeprom_size-2] = checksum;
+					eeprom_data[eeprom_size-1] = checksum >> 8;
+					eeprom_data[eeprom_size-2] = checksum;
 				}
 
-				uint16_t checksum_chip = (eeprom_data[u.ftdic.eeprom_size-1] << 8) | eeprom_data[u.ftdic.eeprom_size-2];
-				if (checksum != checksum_chip) {
+				uint16_t checksum_chip = (eeprom_data[eeprom_size-1] << 8) | eeprom_data[eeprom_size-2];
+				if (!ignchecksum && checksum != checksum_chip) {
 					fprintf(stderr, "ERROR: Checksum from EEPROM data is invalid! (is 0x%04x instead of 0x%04x)\n",
 							checksum_chip, checksum);
 					h_shutdown(&h);
 					return 1;
 				}
 
-				if (ftdi_write_eeprom(&u.ftdic, eeprom_data) < 0) {
-					fprintf(stderr, "Writing EEPROM data failed! (size=%d)\n", u.ftdic.eeprom_size);
+				if (ftdi_set_eeprom_buf(&u.ftdic, eeprom_data, eeprom_size) < 0) {
+					fprintf(stderr, "Setting EEPROM data failed!");
+					h_shutdown(&h);
+					return 1;
+            }
+            // force set eeprom size
+            u.ftdic.eeprom->size = eeprom_size;
+            u.ftdic.eeprom->initialized_for_connected_device = 1;
+				if (ftdi_write_eeprom(&u.ftdic) < 0) {
+					fprintf(stderr, "Writing EEPROM data failed! (size=%d)\n", eeprom_size);
 					h_shutdown(&h);
 					return 1;
 				}
+            
+            free(eeprom_data);
+            
 				if (h_shutdown(&h) < 0)
 					return 1;
 			}
@@ -1027,13 +1065,36 @@ int main(int argc, char **argv)
 				gotaction = 1;
 				if (h_setup(&h) < 0)
 					return 1;
-				int eeprom_size = u.ftdic.eeprom_size;
-				unsigned char eeprom_data[eeprom_size];
-				if (ftdi_read_eeprom(&u.ftdic, eeprom_data) < 0) {
-					fprintf(stderr, "Reading EEPROM data failed! (size=%d)\n", u.ftdic.eeprom_size);
+				int eeprom_size;
+				unsigned char *eeprom_data;
+            
+            if (ftdi_read_eeprom(&u.ftdic) < 0)
+            {
+               fprintf(stderr, "Reading EEPROM data failed!\n");
 					h_shutdown(&h);
 					return 1;
 				}
+            if (ftdi_get_eeprom_value(&u.ftdic, CHIP_SIZE, &eeprom_size) < 0)
+            {
+               fprintf(stderr, "Reading EEPROM size failed!\n");
+					h_shutdown(&h);
+					return 1;
+            }
+            if (eeprom_size == -1)
+            {
+               fprintf(stderr, "EEPROM size invalid! Reprogram or check your hardware\n");
+               h_shutdown(&h);
+               return 1;
+            }
+            
+            eeprom_data = malloc(eeprom_size);
+            if (ftdi_get_eeprom_buf(&u.ftdic, eeprom_data, eeprom_size) < 0)
+            {
+               fprintf(stderr, "Reading EEPROM data failed! (size=%d)\n", eeprom_size);
+					h_shutdown(&h);
+					return 1;
+				}
+            
 				if (h_shutdown(&h) < 0)
 					return 1;
 
@@ -1047,6 +1108,7 @@ int main(int argc, char **argv)
 					return 1;
 				}
 				fclose(f);
+            free(eeprom_data);
 
 				uint16_t checksum = eeprom_checksum(eeprom_data, eeprom_size-2);
 				uint16_t checksum_chip = (eeprom_data[eeprom_size-1] << 8) | eeprom_data[eeprom_size-2];
